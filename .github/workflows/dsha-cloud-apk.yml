@@ -125,24 +125,66 @@ jobs:
           echo "rootfs 大小：$(sudo du -sh "$ROOTFS" | cut -f1)"
           sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
 
-      - name: 对齐 ubuntu-tools 基础包状态
+      - name: 在 rootfs 内下载基础工具 deb
         run: |
           set -euo pipefail
           ROOTFS="$RUNNER_TEMP/rootfs"
-          H="$(sha256sum "$ROOTFS/var/lib/dpkg/status" | cut -d' ' -f1)"
-          LOCK=tools/ubuntu-tools/packages.lock.json
-          CUR="$(python3 -c "import json;print(json.load(open('$LOCK'))['baseStatusSha256'])")"
-          echo "rootfs dpkg status sha256 = $H"
-          echo "lock  baseStatusSha256     = $CUR"
-          if [ "$CUR" != "$H" ]; then
-            python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['baseStatusSha256']=sys.argv[2]; open(p,'w').write(json.dumps(d,indent=2,ensure_ascii=False)+chr(10)); print('baseStatusSha256 ->',sys.argv[2])" "$LOCK" "$H"
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount -t sysfs sysfs "$ROOTFS/sys"
+          sudo mount --bind /dev "$ROOTFS/dev"
+          sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
+          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+          if ! sudo test -s "$ROOTFS/etc/apt/sources.list" \
+             && ! sudo bash -c "ls '$ROOTFS'/etc/apt/sources.list.d/*.sources" >/dev/null 2>&1; then
+            printf 'deb http://ports.ubuntu.com/ubuntu-ports noble main universe\ndeb http://ports.ubuntu.com/ubuntu-ports noble-updates main universe\ndeb http://ports.ubuntu.com/ubuntu-ports noble-security main universe\n' \
+              | sudo tee "$ROOTFS/etc/apt/sources.list" >/dev/null
           fi
+          sudo mkdir -p "$ROOTFS/tmp/dshadebs"
+          echo "== apt-get update =="
+          sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/bash -c 'apt-get update -y' 2>&1 | tail -5
+          echo "== 下载 curl/git/ca-certificates 及其依赖 =="
+          sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/bash -c 'apt-get install -y --no-install-recommends --download-only -o Dir::Cache::archives=/tmp/dshadebs curl git ca-certificates'
+          sudo chroot "$ROOTFS" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/bash -c 'apt-get install -y --no-install-recommends --print-uris -o Dir::Cache::archives=/tmp/dshadebs curl git ca-certificates' \
+            > /tmp/print-uris.txt 2>&1 || true
+          sudo ls -l "$ROOTFS/tmp/dshadebs"
+          mkdir -p app/build/ubuntu-tools-cache
+          sudo cp "$ROOTFS"/tmp/dshadebs/*.deb app/build/ubuntu-tools-cache/
+          sudo chown -R "$(id -u):$(id -g)" app/build/ubuntu-tools-cache
+          ls -lh app/build/ubuntu-tools-cache | head -40
+
+      - name: 清理 rootfs 内的 apt 临时数据
+        run: |
+          set -euo pipefail
+          ROOTFS="$RUNNER_TEMP/rootfs"
+          sudo rm -rf "$ROOTFS/tmp/dshadebs" "$ROOTFS/var/lib/apt/lists" "$ROOTFS/var/cache/apt"
+          sudo mkdir -p "$ROOTFS/var/lib/apt/lists/partial" "$ROOTFS/var/cache/apt/archives/partial"
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          for m in dev/pts dev proc sys; do sudo umount -l "$ROOTFS/$m" 2>/dev/null || true; done
+          sudo rm -rf "$ROOTFS/tmp"/* "$ROOTFS/var/log/apt"/* "$ROOTFS/var/log/dpkg.log" 2>/dev/null || true
+
+      - name: 重建 packages.lock.json
+        run: |
+          set -euo pipefail
+          cp tools/prepare-ubuntu-tools.py /tmp/prepare-ubuntu-tools.py.orig
+          # 现网闭包里可能含 universe 组件；放宽仓库脚本里写死的 main 前缀校验。
+          sed -i "s|relative.startswith('pool/main/')|relative.startswith(('pool/main/','pool/universe/'))|" tools/prepare-ubuntu-tools.py
+          python3 tools/ci-make-ubuntu-lock.py \
+            --cache app/build/ubuntu-tools-cache \
+            --rootfs "$RUNNER_TEMP/rootfs" \
+            --lock tools/ubuntu-tools/packages.lock.json \
+            --uris /tmp/print-uris.txt
 
       - name: 生成 ubuntu-tools.bin
         run: |
           set -euo pipefail
-          python3 tools/prepare-ubuntu-tools.py | tee /tmp/ubuntu-tools.json
-          ls -lh app/src/main/assets/ubuntu-tools.bin
+          python3 tools/prepare-ubuntu-tools.py --cache app/build/ubuntu-tools-cache | tee /tmp/ubuntu-tools.json
+          ls -lh app/src/main/assets/ubuntu-tools.bin app/src/main/assets/ubuntu-tools.inputs.json
 
       - name: 打包 offline-rootfs.bin
         run: |
@@ -200,6 +242,7 @@ jobs:
             app/src/main/assets/offline-rootfs.bin
             app/src/main/assets/managed-package-proofs.json
             tools/ubuntu-tools/packages.lock.json
+            tools/prepare-ubuntu-tools.py
           if-no-files-found: error
           retention-days: 7
 
@@ -232,9 +275,10 @@ jobs:
               rm -f "app/src/main/assets/$f"
             fi
           done
-          # ubuntu-tools.inputs.json 里的 inputs 含 packages.lock.json 的摘要，
-          # 必须用同一份（可能已对齐 baseStatusSha256 的）锁文件。
+          # ubuntu-tools.inputs.json 里的 inputs 含 packages.lock.json 与
+          # prepare-ubuntu-tools.py 的摘要，两样都必须用构建资产时的同一份。
           cp offline-assets/packages.lock.json tools/ubuntu-tools/packages.lock.json
+          cp offline-assets/prepare-ubuntu-tools.py tools/prepare-ubuntu-tools.py
           ls -lh app/src/main/assets/*.bin
 
       - name: JDK 17
