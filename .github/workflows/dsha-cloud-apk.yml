@@ -46,28 +46,40 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3 xz-utils build-essential ca-certificates
 
-      - name: 安装 Node 24 (arm64)
+      - name: 安装 Node 24.19.0 (arm64)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: tools/dsh-runtime/package-lock.json
+
+      - name: 下载 Node 24.19.0 arm64 归档（供 rootfs 注入）
         run: |
           set -euo pipefail
           VER="24.19.0"
           URL="https://nodejs.org/dist/v${VER}/node-v${VER}-linux-arm64.tar.xz"
           if ! curl -fL --retry 3 --retry-delay 2 -m 600 -o /tmp/node.tar.xz "$URL"; then
-            echo "v${VER} 不可用，改取最新的 v24.x"
+            echo "::warning title=Node 版本回退::v${VER} 归档不可用，改用最新的 v24.x（本地覆盖层的 ABI 可能与内置运行时不同）"
             VER="$(curl -fsSL -m 60 https://nodejs.org/dist/index.json \
               | python3 -c "import json,sys;print(next(x['version'][1:] for x in json.load(sys.stdin) if x['version'].startswith('v24.')))")"
             URL="https://nodejs.org/dist/v${VER}/node-v${VER}-linux-arm64.tar.xz"
             curl -fL --retry 3 --retry-delay 2 -m 600 -o /tmp/node.tar.xz "$URL"
           fi
-          sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
           node -v
           npm -v
+          ls -lh /tmp/node.tar.xz
           echo "NODE_VERSION=$VER" >> "$GITHUB_ENV"
 
       - name: 生成 dsh 离线覆盖层 (npm ci → dsh-runtime.bin)
         run: |
           set -euo pipefail
+          echo "node=$(node -v) npm=$(npm -v)"
           cd tools/dsh-runtime
-          npm ci --no-audit --no-fund --loglevel=error
+          if ! npm ci --no-audit --no-fund; then
+            echo "---- npm debug log ----"
+            tail -60 "$HOME"/.npm/_logs/*-debug-0.log 2>/dev/null || true
+            exit 1
+          fi
           cd "$GITHUB_WORKSPACE"
           python3 tools/build-dsh-runtime.py \
             --source tools/dsh-runtime/node_modules \
