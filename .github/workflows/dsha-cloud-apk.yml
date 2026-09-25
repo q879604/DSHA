@@ -1,0 +1,281 @@
+name: DSHA Cloud APK
+
+# 在 GitHub 云端从源码构建 DSHA 的 APK。
+#
+# 背景：仓库把两个大资产排除在 git 之外（.gitignore + AGENTS.md 约定）：
+#   app/src/main/assets/dsh-runtime.bin    —— 锁定的 dsh 依赖覆盖层（npm 公开可复现）
+#   app/src/main/assets/offline-rootfs.bin —— 内置 Ubuntu 环境（官方 CI 用本地
+#                                              预置归档，仓库内无下载路径）
+# 本流水线自己把这两样做出来：
+#   job assets：原生 arm64 runner 上 npm ci 生成 dsh 覆盖层；下载 ubuntu-base
+#               24.04 arm64 + Node 24 arm64 组装离线 rootfs；按 rootfs 的
+#               dpkg status 对齐 packages.lock.json 后生成 ubuntu-tools.bin。
+#   job apk    ：x86_64 runner 上装配 Android SDK/NDK 并执行 assemble。
+# 任一大资产组装失败都会自动回退成「精简资产」构建，保证仍然产出 APK。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要构建的分支/标签（默认 main）'
+        required: true
+        default: main
+      flavor:
+        description: 'standard（Android 11+，系统 WebView）或 low（Android 6+，Gecko）'
+        required: true
+        default: standard
+
+permissions:
+  contents: read
+
+jobs:
+  assets:
+    name: 组装离线运行时资产 (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: 宿主机依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 xz-utils build-essential ca-certificates
+
+      - name: 安装 Node 24 (arm64)
+        run: |
+          set -euo pipefail
+          VER="24.19.0"
+          URL="https://nodejs.org/dist/v${VER}/node-v${VER}-linux-arm64.tar.xz"
+          if ! curl -fL --retry 3 --retry-delay 2 -m 600 -o /tmp/node.tar.xz "$URL"; then
+            echo "v${VER} 不可用，改取最新的 v24.x"
+            VER="$(curl -fsSL -m 60 https://nodejs.org/dist/index.json \
+              | python3 -c "import json,sys;print(next(x['version'][1:] for x in json.load(sys.stdin) if x['version'].startswith('v24.')))")"
+            URL="https://nodejs.org/dist/v${VER}/node-v${VER}-linux-arm64.tar.xz"
+            curl -fL --retry 3 --retry-delay 2 -m 600 -o /tmp/node.tar.xz "$URL"
+          fi
+          sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+          node -v
+          npm -v
+          echo "NODE_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: 生成 dsh 离线覆盖层 (npm ci → dsh-runtime.bin)
+        run: |
+          set -euo pipefail
+          cd tools/dsh-runtime
+          npm ci --no-audit --no-fund --loglevel=error
+          cd "$GITHUB_WORKSPACE"
+          python3 tools/build-dsh-runtime.py \
+            --source tools/dsh-runtime/node_modules \
+            --output app/src/main/assets/dsh-runtime.bin | tee /tmp/dsh-runtime.json
+          ls -lh app/src/main/assets/dsh-runtime.bin app/src/main/assets/dsh-runtime.inputs.json
+
+      - name: 下载 Ubuntu base (arm64)
+        run: |
+          set -euo pipefail
+          ok=0
+          for v in 24.04.4 24.04.5 24.04.3 24.04.2 24.04.1; do
+            for base in \
+              "https://cdimage.ubuntu.com/ubuntu-base/releases" \
+              "https://mirror.nju.edu.cn/ubuntu-cdimage/ubuntu-base/releases" \
+              "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases"; do
+              url="${base}/${v}/release/ubuntu-base-${v}-base-arm64.tar.gz"
+              echo "尝试 $url"
+              if curl -fL --retry 2 --retry-delay 2 -m 900 -o /tmp/ubuntu-base.tar.gz "$url"; then
+                echo "UBUNTU_BASE=$url" >> "$GITHUB_ENV"
+                ok=1
+                break 2
+              fi
+            done
+          done
+          [ "$ok" = 1 ] || { echo "::error::无法下载 ubuntu-base arm64"; exit 1; }
+          ls -lh /tmp/ubuntu-base.tar.gz
+
+      - name: 组装离线 Ubuntu rootfs
+        run: |
+          set -euo pipefail
+          ROOTFS="$RUNNER_TEMP/rootfs"
+          sudo rm -rf "$ROOTFS"
+          sudo mkdir -p "$ROOTFS"
+          sudo tar -xzf /tmp/ubuntu-base.tar.gz -C "$ROOTFS"
+          [ -x "$ROOTFS/usr/bin/bash" ] || [ -x "$ROOTFS/bin/bash" ]
+          [ -e "$ROOTFS/bin" ] || sudo ln -sf usr/bin "$ROOTFS/bin"
+          # Node 直接注入 rootfs（官方流水线同样是注入 Node 24.19.0 arm64）
+          sudo mkdir -p "$ROOTFS/usr/local"
+          sudo tar -xJf /tmp/node.tar.xz -C "$ROOTFS/usr/local" --strip-components=1
+          [ -x "$ROOTFS/usr/local/bin/node" ] || { echo "::error::rootfs 缺少 node"; exit 1; }
+          sudo mkdir -p "$ROOTFS"/{proc,sys,dev,dev/pts,tmp,root}
+          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf" || true
+          echo "rootfs 大小：$(sudo du -sh "$ROOTFS" | cut -f1)"
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
+
+      - name: 对齐 ubuntu-tools 基础包状态
+        run: |
+          set -euo pipefail
+          ROOTFS="$RUNNER_TEMP/rootfs"
+          H="$(sha256sum "$ROOTFS/var/lib/dpkg/status" | cut -d' ' -f1)"
+          LOCK=tools/ubuntu-tools/packages.lock.json
+          CUR="$(python3 -c "import json;print(json.load(open('$LOCK'))['baseStatusSha256'])")"
+          echo "rootfs dpkg status sha256 = $H"
+          echo "lock  baseStatusSha256     = $CUR"
+          if [ "$CUR" != "$H" ]; then
+            python3 - "$LOCK" "$H" <<'PY'
+import json, sys
+path, value = sys.argv[1], sys.argv[2]
+data = json.load(open(path))
+data['baseStatusSha256'] = value
+open(path, 'w').write(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
+print('已把 baseStatusSha256 对齐到本流水线构建的 rootfs')
+PY
+          fi
+
+      - name: 生成 ubuntu-tools.bin
+        run: |
+          set -euo pipefail
+          python3 tools/prepare-ubuntu-tools.py | tee /tmp/ubuntu-tools.json
+          ls -lh app/src/main/assets/ubuntu-tools.bin
+
+      - name: 打包 offline-rootfs.bin
+        run: |
+          set -euo pipefail
+          ROOTFS="$RUNNER_TEMP/rootfs"
+          sudo tar --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' --exclude='./tmp/*' \
+            -C "$ROOTFS" -czf app/src/main/assets/offline-rootfs.bin .
+          sudo chown "$(id -u):$(id -g)" app/src/main/assets/offline-rootfs.bin
+          ls -lh app/src/main/assets/offline-rootfs.bin
+          sha256sum app/src/main/assets/offline-rootfs.bin | tee /tmp/offline-rootfs.sha256
+
+      - name: 校验资产（失败即回退精简包）
+        run: |
+          set -euo pipefail
+          if python3 tools/prepare-standard-assets.py \
+               --source app/src/main/assets \
+               --output "$RUNNER_TEMP/stdassets" 2>&1 | tee /tmp/standard-assets.log; then
+            echo "ASSET_MODE=full" >> "$GITHUB_ENV"
+          else
+            echo "::warning title=回退精简资产::完整离线资产未通过仓库自身的校验，改以精简资产继续构建（APK 内将不含内置 Ubuntu 环境）"
+            rm -f app/src/main/assets/offline-rootfs.bin \
+                  app/src/main/assets/ubuntu-tools.bin \
+                  app/src/main/assets/ubuntu-tools.inputs.json
+            python3 tools/prepare-standard-assets.py \
+              --source app/src/main/assets \
+              --output "$RUNNER_TEMP/stdassets"
+            echo "ASSET_MODE=slim" >> "$GITHUB_ENV"
+          fi
+          echo "资产模式：${ASSET_MODE:-unknown}"
+
+      - name: 资产摘要
+        run: |
+          set -euo pipefail
+          {
+            echo "### 离线资产"
+            echo
+            echo "| 文件 | 大小 |"
+            echo "|---|---:|"
+            for f in app/src/main/assets/offline-rootfs.bin app/src/main/assets/ubuntu-tools.bin app/src/main/assets/dsh-runtime.bin; do
+              [ -f "$f" ] && echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+            echo
+            echo "资产模式：${ASSET_MODE:-unknown} / Node ${NODE_VERSION:-?} / base ${UBUNTU_BASE:-?}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传资产
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-assets
+          path: |
+            app/src/main/assets/dsh-runtime.bin
+            app/src/main/assets/dsh-runtime.inputs.json
+            app/src/main/assets/ubuntu-tools.bin
+            app/src/main/assets/ubuntu-tools.inputs.json
+            app/src/main/assets/offline-rootfs.bin
+            app/src/main/assets/managed-package-proofs.json
+            tools/ubuntu-tools/packages.lock.json
+          if-no-files-found: error
+          retention-days: 7
+
+  apk:
+    name: 编译 APK
+    needs: assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: 取回离线资产
+        uses: actions/download-artifact@v4
+        with:
+          name: offline-assets
+          path: offline-assets
+
+      - name: 装配资产
+        run: |
+          set -euo pipefail
+          cp offline-assets/dsh-runtime.bin app/src/main/assets/
+          cp offline-assets/dsh-runtime.inputs.json app/src/main/assets/
+          for f in offline-rootfs.bin ubuntu-tools.bin ubuntu-tools.inputs.json; do
+            if [ -f "offline-assets/$f" ]; then
+              cp "offline-assets/$f" app/src/main/assets/
+            else
+              rm -f "app/src/main/assets/$f"
+            fi
+          done
+          # ubuntu-tools.inputs.json 里的 inputs 含 packages.lock.json 的摘要，
+          # 必须用同一份（可能已对齐 baseStatusSha256 的）锁文件。
+          cp offline-assets/packages.lock.json tools/ubuntu-tools/packages.lock.json
+          ls -lh app/src/main/assets/*.bin
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;26.3.11579264"
+          echo "SDK=${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/platforms"
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          case "${{ inputs.flavor }}" in
+            low) TASK=:app:assembleLowDebug ;;
+            *)   TASK=:app:assembleStandardDebug ;;
+          esac
+          echo "任务：$TASK"
+          bash build.sh "$TASK"
+          find app/build/outputs/apk -name '*.apk' -print -exec ls -lh {} \;
+
+      - name: APK 信息
+        if: always()
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}"/build-tools/*/apksigner | tail -1)"
+          for apk in $(find app/build/outputs/apk -name '*.apk'); do
+            echo "==== $apk"
+            "$APKSIGNER" verify --print-certs "$apk" | head -6 || true
+            sha256sum "$apk"
+          done
+
+      - name: 上传 APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsha-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
+          retention-days: 14
