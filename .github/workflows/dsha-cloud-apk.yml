@@ -281,24 +281,17 @@ jobs:
       - name: 装配资产
         run: |
           set -euo pipefail
-          cp offline-assets/dsh-runtime.bin app/src/main/assets/
-          cp offline-assets/dsh-runtime.inputs.json app/src/main/assets/
-          for f in offline-rootfs.bin ubuntu-tools.bin ubuntu-tools.inputs.json; do
-            if [ -f "offline-assets/$f" ]; then
-              cp "offline-assets/$f" app/src/main/assets/
-            else
-              rm -f "app/src/main/assets/$f"
-            fi
-          done
-          # ubuntu-tools.inputs.json 里的 inputs 含 packages.lock.json 与
-          # prepare-ubuntu-tools.py 的摘要，两样都必须用构建资产时的同一份。
-          cp offline-assets/packages.lock.json tools/ubuntu-tools/packages.lock.json
-          cp offline-assets/prepare-ubuntu-tools.py tools/prepare-ubuntu-tools.py
-          # 网页兼容资产是重新生成的，必须用生成时的那一份（含 inputs 摘要）
-          for f in es-compat.js es-compat.inputs.json core-js.LICENSE; do
-            cp "offline-assets/$f" app/src/main/assets/web-integration/
-          done
+          echo "== 产物内容 =="
+          find offline-assets -type f -printf '%12s  %p\n' | sort -k2
+          # upload-artifact 会保留工作区相对路径（最小公共祖先=仓库根），
+          # 所以直接覆盖回工作区，文件各回原位；仓库里被提交的过期
+          # 网页兼容资产也一并被生成版本替换。
+          cp -a offline-assets/. .
+          if [ ! -f app/src/main/assets/offline-rootfs.bin ]; then
+            echo "::warning::本次产物不含内置 Ubuntu 运行时（精简模式）"
+          fi
           ls -lh app/src/main/assets/*.bin
+          ls -l app/src/main/assets/web-integration/es-compat.inputs.json
 
       - name: JDK 17
         uses: actions/setup-java@v4
