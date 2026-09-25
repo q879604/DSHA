@@ -123,14 +123,7 @@ jobs:
           echo "rootfs dpkg status sha256 = $H"
           echo "lock  baseStatusSha256     = $CUR"
           if [ "$CUR" != "$H" ]; then
-            python3 - "$LOCK" "$H" <<'PY'
-import json, sys
-path, value = sys.argv[1], sys.argv[2]
-data = json.load(open(path))
-data['baseStatusSha256'] = value
-open(path, 'w').write(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
-print('已把 baseStatusSha256 对齐到本流水线构建的 rootfs')
-PY
+            python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['baseStatusSha256']=sys.argv[2]; open(p,'w').write(json.dumps(d,indent=2,ensure_ascii=False)+chr(10)); print('baseStatusSha256 ->',sys.argv[2])" "$LOCK" "$H"
           fi
 
       - name: 生成 ubuntu-tools.bin
