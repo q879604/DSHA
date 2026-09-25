@@ -70,6 +70,18 @@ jobs:
           ls -lh /tmp/node.tar.xz
           echo "NODE_VERSION=$VER" >> "$GITHUB_ENV"
 
+      - name: 重新生成网页兼容资产
+        run: |
+          set -euo pipefail
+          # 仓库里提交的 es-compat.inputs.json 与当前源码摘要不一致（上游改了
+          # tools/prepare-web-compat.mjs 但没重新生成），构建前置校验会拒绝，
+          # 这里按官方提示重新生成。
+          npm ci --prefix tools/web-compat --ignore-scripts --no-audit --no-fund
+          node tools/prepare-web-compat.mjs
+          ls -l app/src/main/assets/web-integration/es-compat.js \
+                app/src/main/assets/web-integration/es-compat.inputs.json \
+                app/src/main/assets/web-integration/core-js.LICENSE
+
       - name: 生成 dsh 离线覆盖层 (npm ci → dsh-runtime.bin)
         run: |
           set -euo pipefail
@@ -241,6 +253,9 @@ jobs:
             app/src/main/assets/ubuntu-tools.inputs.json
             app/src/main/assets/offline-rootfs.bin
             app/src/main/assets/managed-package-proofs.json
+            app/src/main/assets/web-integration/es-compat.js
+            app/src/main/assets/web-integration/es-compat.inputs.json
+            app/src/main/assets/web-integration/core-js.LICENSE
             tools/ubuntu-tools/packages.lock.json
             tools/prepare-ubuntu-tools.py
           if-no-files-found: error
@@ -279,6 +294,10 @@ jobs:
           # prepare-ubuntu-tools.py 的摘要，两样都必须用构建资产时的同一份。
           cp offline-assets/packages.lock.json tools/ubuntu-tools/packages.lock.json
           cp offline-assets/prepare-ubuntu-tools.py tools/prepare-ubuntu-tools.py
+          # 网页兼容资产是重新生成的，必须用生成时的那一份（含 inputs 摘要）
+          for f in es-compat.js es-compat.inputs.json core-js.LICENSE; do
+            cp "offline-assets/$f" app/src/main/assets/web-integration/
+          done
           ls -lh app/src/main/assets/*.bin
 
       - name: JDK 17
