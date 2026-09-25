@@ -299,16 +299,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 组件
+      - name: 准备 Android SDK（直连下载，绕开 sdkmanager）
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;26.3.11579264"
-          echo "SDK=${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          ls "${ANDROID_SDK_ROOT:-$ANDROID_HOME}/platforms"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK=$SDK"
+          python3 tools/ci-install-android-sdk.py --sdk "$SDK" \
+            --package "platforms;android-37.0" \
+            --package "build-tools;36.0.0" \
+            --package "ndk;26.3.11579264"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          ls "$SDK/platforms"
+          ls "$SDK/build-tools"
+          ls "$SDK/ndk"
 
       - name: 编译
         run: |
